@@ -90,7 +90,17 @@ fn infer_field_schema(string: &str, datetime_re: Option<Regex>) -> DataType {
     } else if DECIMAL_RE.is_match(string) {
         DataType::Float64
     } else if INTEGER_RE.is_match(string) {
-        DataType::Int64
+        if string.parse::<i64>().is_ok() {
+            return DataType::Int64;
+        }
+
+        match string.parse::<u64>() {
+            Ok(_) => DataType::UInt64,
+            Err(e) => match e.kind() {
+                std::num::IntErrorKind::PosOverflow => DataType::Decimal128(u8::MAX, 0),
+                _ => DataType::Utf8,
+            },
+        }
     } else if datetime_re.is_match(string) {
         DataType::Date64
     } else if DATE_RE.is_match(string) {
@@ -1555,6 +1565,18 @@ mod tests {
         assert_eq!(infer_field_schema("A", None), DataType::Utf8);
         assert_eq!(infer_field_schema("\"123\"", None), DataType::Utf8);
         assert_eq!(infer_field_schema("10", None), DataType::Int64);
+        assert_eq!(
+            infer_field_schema("9223372036854775807", None),
+            DataType::Int64
+        );
+        assert_eq!(
+            infer_field_schema("18446744073709551615", None),
+            DataType::UInt64
+        );
+        assert_eq!(
+            infer_field_schema("18446744073709551616", None),
+            DataType::Decimal128(u8::MAX, 0)
+        );
         assert_eq!(infer_field_schema("10.2", None), DataType::Float64);
         assert_eq!(infer_field_schema(".2", None), DataType::Float64);
         assert_eq!(infer_field_schema("2.", None), DataType::Float64);
