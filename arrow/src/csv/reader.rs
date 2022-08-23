@@ -76,106 +76,60 @@ lazy_static! {
         Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$").unwrap();
 }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-enum InferredFieldType {
-    Numeric {
-        negative: bool,
-        digits: usize,
-        decimals: usize,
-    },
-    ArrowType(DataType),
-    Unknown,
-}
-
-fn get_best_match_for_inferred_types(set: &HashSet<InferredFieldType>) -> DataType {
+fn get_best_match_for_inferred_types(set: &HashSet<DataType>) -> DataType {
     if set.is_empty() {
         return DataType::Utf8;
     }
 
     if set.len() == 1 {
-        let inferred = set.iter().next().unwrap();
-
-        return match inferred {
-            InferredFieldType::Numeric {
-                negative,
-                decimal,
-                len,
-            } => {
-                if *decimal {
-                    return DataType::Float64;
-                }
-
-                if *negative {
-                    return DataType::Int64;
-                }
-
-                return DataType::UInt64;
-            }
-            InferredFieldType::ArrowType(dtype) => dtype.clone(),
-            InferredFieldType::Unknown => DataType::Utf8,
-        };
+        return set.iter().next().unwrap().clone();
     }
 
-    let mut contains_negative = false;
-    let mut contains_decimal = false;
-    let mut numerics_max_len = 0;
-    let mut number_of_numeric_types = 0;
-
-    for inferred in set {
-        if let InferredFieldType::Numeric {
-            negative,
-            decimal,
-            len,
-        } = inferred
-        {
-            number_of_numeric_types += 1;
-            if *negative {
-                contains_negative = true;
-            }
-            if *decimal {
-                contains_decimal = true;
-            }
-        }
+    if set.contains(&DataType::Decimal128(usize::MAX, 0)) {
+        return DataType::Decimal128(usize::MAX, 0);
     }
 
-    if number_of_numeric_types == set.len() {
-        if contains_decimal {
-            return DataType::Float64;
-        }
-
-        if contains_negative {
-            return DataType::Int64;
-        }
-
-        return DataType::Int64;
+    if set.contains(&DataType::UInt64) {
+        return DataType::UInt64;
     }
 
     return DataType::Utf8;
 }
 
 /// Infer the data type of a record
-fn infer_field_schema(string: &str, datetime_re: Option<Regex>) -> InferredFieldType {
+fn infer_field_schema(string: &str, datetime_re: Option<Regex>) -> DataType {
     let datetime_re = datetime_re.unwrap_or_else(|| DATETIME_RE.clone());
     // when quoting is enabled in the reader, these quotes aren't escaped, we default to
     // Utf8 for them
     if string.starts_with('"') {
-        return InferredFieldType::ArrowType(DataType::Utf8);
+        return DataType::Utf8;
     }
     // match regex in a particular order
     if BOOLEAN_RE.is_match(string) {
-        InferredFieldType::ArrowType(DataType::Boolean)
-    } else if DECIMAL_RE.is_match(string) || INTEGER_RE.is_match(string) {
-        InferredFieldType::Numeric {
-            decimal: true,
-            negative: string.starts_with("-"),
-            len: string.trim_start_matches("-").len(),
+        DataType::Boolean
+    } else if DECIMAL_RE.is_match(string) {
+        DataType::Float64
+    } else if INTEGER_RE.is_match(string) {
+        match string.parse::<i64>() {
+            Ok(_) => return DataType::Int64,
+            _ => {}
+        }
+
+        match string.parse::<u64>() {
+            Ok(_) => return DataType::UInt64,
+            Err(e) => match e.kind() {
+                std::num::IntErrorKind::PosOverflow => {
+                    DataType::Decimal128(usize::MAX, 0)
+                }
+                _ => DataType::Utf8,
+            },
         }
     } else if datetime_re.is_match(string) {
-        InferredFieldType::ArrowType(DataType::Date64)
+        DataType::Date64
     } else if DATE_RE.is_match(string) {
-        InferredFieldType::ArrowType(DataType::Date32)
+        DataType::Date32
     } else {
-        InferredFieldType::Unknown
+        DataType::Utf8
     }
 }
 
@@ -277,8 +231,7 @@ fn infer_reader_schema_with_csv_options<R: Read>(
 
     let header_length = headers.len();
     // keep track of inferred field types
-    let mut column_types: Vec<HashSet<InferredFieldType>> =
-        vec![HashSet::new(); header_length];
+    let mut column_types: Vec<HashSet<DataType>> = vec![HashSet::new(); header_length];
 
     // keep track of columns with nulls
     let mut nulls: Vec<bool> = vec![false; header_length];
