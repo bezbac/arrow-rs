@@ -76,27 +76,106 @@ lazy_static! {
         Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$").unwrap();
 }
 
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+enum InferredFieldType {
+    Numeric {
+        negative: bool,
+        digits: usize,
+        decimals: usize,
+    },
+    ArrowType(DataType),
+    Unknown,
+}
+
+fn get_best_match_for_inferred_types(set: &HashSet<InferredFieldType>) -> DataType {
+    if set.is_empty() {
+        return DataType::Utf8;
+    }
+
+    if set.len() == 1 {
+        let inferred = set.iter().next().unwrap();
+
+        return match inferred {
+            InferredFieldType::Numeric {
+                negative,
+                decimal,
+                len,
+            } => {
+                if *decimal {
+                    return DataType::Float64;
+                }
+
+                if *negative {
+                    return DataType::Int64;
+                }
+
+                return DataType::UInt64;
+            }
+            InferredFieldType::ArrowType(dtype) => dtype.clone(),
+            InferredFieldType::Unknown => DataType::Utf8,
+        };
+    }
+
+    let mut contains_negative = false;
+    let mut contains_decimal = false;
+    let mut numerics_max_len = 0;
+    let mut number_of_numeric_types = 0;
+
+    for inferred in set {
+        if let InferredFieldType::Numeric {
+            negative,
+            decimal,
+            len,
+        } = inferred
+        {
+            number_of_numeric_types += 1;
+            if *negative {
+                contains_negative = true;
+            }
+            if *decimal {
+                contains_decimal = true;
+            }
+        }
+    }
+
+    if number_of_numeric_types == set.len() {
+        if contains_decimal {
+            return DataType::Float64;
+        }
+
+        if contains_negative {
+            return DataType::Int64;
+        }
+
+        return DataType::Int64;
+    }
+
+    return DataType::Utf8;
+}
+
 /// Infer the data type of a record
-fn infer_field_schema(string: &str, datetime_re: Option<Regex>) -> DataType {
+fn infer_field_schema(string: &str, datetime_re: Option<Regex>) -> InferredFieldType {
     let datetime_re = datetime_re.unwrap_or_else(|| DATETIME_RE.clone());
     // when quoting is enabled in the reader, these quotes aren't escaped, we default to
     // Utf8 for them
     if string.starts_with('"') {
-        return DataType::Utf8;
+        return InferredFieldType::ArrowType(DataType::Utf8);
     }
     // match regex in a particular order
     if BOOLEAN_RE.is_match(string) {
-        DataType::Boolean
-    } else if DECIMAL_RE.is_match(string) {
-        DataType::Float64
-    } else if INTEGER_RE.is_match(string) {
-        DataType::Int64
+        InferredFieldType::ArrowType(DataType::Boolean)
+    } else if DECIMAL_RE.is_match(string) || INTEGER_RE.is_match(string) {
+        InferredFieldType::Numeric {
+            decimal: true,
+            negative: string.starts_with("-"),
+            len: string.trim_start_matches("-").len(),
+        }
     } else if datetime_re.is_match(string) {
-        DataType::Date64
+        InferredFieldType::ArrowType(DataType::Date64)
     } else if DATE_RE.is_match(string) {
-        DataType::Date32
+        InferredFieldType::ArrowType(DataType::Date32)
     } else {
-        DataType::Utf8
+        InferredFieldType::Unknown
     }
 }
 
@@ -198,7 +277,9 @@ fn infer_reader_schema_with_csv_options<R: Read>(
 
     let header_length = headers.len();
     // keep track of inferred field types
-    let mut column_types: Vec<HashSet<DataType>> = vec![HashSet::new(); header_length];
+    let mut column_types: Vec<HashSet<InferredFieldType>> =
+        vec![HashSet::new(); header_length];
+
     // keep track of columns with nulls
     let mut nulls: Vec<bool> = vec![false; header_length];
 
@@ -230,28 +311,8 @@ fn infer_reader_schema_with_csv_options<R: Read>(
         let possibilities = &column_types[i];
         let has_nulls = nulls[i];
         let field_name = &headers[i];
-
-        // determine data type based on possible types
-        // if there are incompatible types, use DataType::Utf8
-        match possibilities.len() {
-            1 => {
-                for dtype in possibilities.iter() {
-                    fields.push(Field::new(field_name, dtype.clone(), has_nulls));
-                }
-            }
-            2 => {
-                if possibilities.contains(&DataType::Int64)
-                    && possibilities.contains(&DataType::Float64)
-                {
-                    // we have an integer and double, fall down to double
-                    fields.push(Field::new(field_name, DataType::Float64, has_nulls));
-                } else {
-                    // default to Utf8 for conflicting datatypes (e.g bool and int)
-                    fields.push(Field::new(field_name, DataType::Utf8, has_nulls));
-                }
-            }
-            _ => fields.push(Field::new(field_name, DataType::Utf8, has_nulls)),
-        }
+        let dtype = get_best_match_for_inferred_types(possibilities);
+        fields.push(Field::new(field_name, dtype.clone(), has_nulls));
     }
 
     Ok((Schema::new(fields), records_count))
